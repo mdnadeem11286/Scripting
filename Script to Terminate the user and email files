@@ -1,0 +1,553 @@
+#Disable IDS only if they are recorded after 1/1/2024 and the conditions are ID must be still active, there should not be any expiry date updated and Lastday as per Termination register is less than today.
+#Disable date will be updated in Notes section in AD under Telephone tab.
+# The excel output sheet will be created only if the above conditions are true and will store info 'UserID ,EMPNAME, EMPINTERMINATION, EMPINPEOPLE, LastDay,OldStatus, NewStatus, RecordedDate, ManagerName, OldNotes, NewNotes
+
+cls;
+
+# Set up log file name with current date
+$logFileName = "terminate_users_$(Get-Date -Format 'dd-MM-yyyy hhmmss').log"
+
+#Path: Update the path for Logfile till the last \
+$logFileFullpath = "C:\TempLIS\Termination Logs\"
+
+
+# A log file will be created at this path
+$logFilePath=$logFileFullpath+$logFileName
+
+# Start logging - Script start time
+$startTime = Get-Date
+"Script started at: $startTime" | Out-File -FilePath $logFilePath -Append
+
+
+# Install the ImportExcel module if not already installed
+# Install-Module -Name ImportExcel -Force -SkipPublisherCheck
+
+# Specify your SQL Server connection details
+#$server = "Servernane" or
+$server= "Ipadress"
+$instance = "InstanceName"
+$port = portnumber
+
+# Initialize variablespa
+$userID = $null
+$EmpCodeinTermination = $null
+$EmpCodeinPeople = $null
+
+#Conditions are the record in termination register must be added after 1st Jan 2023
+#The cessation column must be 1 which means we need to terminate the user and it was not revoked.
+#The same EMP from termination will be checked in PhoneDirectory and see if the user has multiple entries for the same employee, the script will check only the most recent emp number.
+
+
+$sqlQuery = @"
+SELECT 
+    p.projectcode, 
+    t.empname,
+    p.adlogin, 
+    p.role, 
+    p.visible,
+    t.empcode, 
+    t.lastdt,
+    t.recdt AS RecordedDate
+FROM 
+    [Phonedirectory].[dbo].[person] AS p
+INNER JOIN 
+    [TerminationRegister].[dbo].[termination] AS t 
+ON 
+    t.empcode COLLATE SQL_Latin1_General_CP1_CI_AS = p.projectcode COLLATE SQL_Latin1_General_CP1_CI_AS
+WHERE p.adlogin IS NOT NULL
+    AND p.adlogin <> ''
+    AND p.personid = (
+        SELECT 
+            MAX(b.personid) 
+        FROM 
+            [Phonedirectory].[dbo].[person] AS b 
+        WHERE 
+            b.adlogin = p.adlogin
+    )
+    AND t.cessation = 1 AND t.recdt >= '2024-01-01 00:00:00'
+	AND TRY_CONVERT(date, t.lastdt, 105) = CONVERT(date, GETDATE())	
+"@  
+
+
+
+#Credentials:  Invoke SQL query with specified credentials
+#$username
+#$password
+
+
+#$sqlData = Invoke-Sqlcmd -ServerInstance "$server,$port\$instance" -Query $sqlQuery -Username $username -Password $password -ErrorAction Stop -TrustServerCertificate
+
+
+try 
+{
+     $sqlData = Invoke-Sqlcmd -ServerInstance "$server,$port\$instance" -Query $sqlQuery -ErrorAction Stop -TrustServerCertificate
+     try
+	 {
+	 $rowCount = $sqlData.Count
+	 if($rowCount -eq $null)
+	 {
+		  $rowCount=1;
+	 }
+	 }
+	 catch
+	 {
+		  $rowCount=1;
+	 }
+	
+	#Add a SQL Success line in the log file.
+	
+
+	"Success: SQL query executed successfully $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')" | Out-File -FilePath $logFilePath -Append
+	"Success: Found $rowCount number of rows" | Out-File -FilePath $logFilePath -Append
+ 
+ }
+ 
+catch 
+{
+      # Handle the error as needed and add a line to the log file.
+	$errorMessage = "Failure: Failed to Execute SQL query Error: $_"
+    $errorMessage | Out-File -FilePath $logFilePath -Append
+}
+
+$outputData = @()
+$needNewFile = $false  # Initialize $needNewFile outside of the loop
+
+foreach ($row in $sqlData) 
+{
+    $userID = $row.adlogin.Trim()
+	
+	#eliminate these 3 ids as these ids incorrectly updated in Phone Directory
+	if ($userID -in 'excepid1', 'exceptionid2', 'exceptoionid3') 
+	{
+        continue  # Skip processing for this user and move to the next iteration
+    }
+	
+    $EmpCodeinTermination = $row.empcode
+    $EmpCodeinPeople = $row.projectcode
+    $LastDay = [datetime]::Parse($row.lastdt)  # Parse lastdt as DateTime
+	$year=$LastDay.year
+    $OldStatus = $null
+    $expirydate = 0
+    $Visiblity = $row.visible
+    $RecordedDate = $row.RecordedDate 
+    $EmpName = $row.empname
+	$MemberGroups=$null
+	$targetOU = "OU=$year,OU=Resigned Users,OU=LAS,DC=Domain,DC=Domain,DC=Domain"
+    
+        try 
+        {
+        $user = Get-ADUser -Identity $userID -Properties Description, Title, Enabled, Manager, AccountExpirationDate, Info -ErrorAction Stop
+
+        # Set status based on user's enabled status
+        $OldStatus = if ($user.Enabled) { "Enabled" } else { "Disabled" }
+        $expirydate = $user.AccountExpirationDate
+
+        # Extract existing notes
+        $ExistingNotes = $user.Info
+		
+		# Get the existing Description attribute
+		$Description = $user.Description
+		
+		#Add a AD account retrieval Success line in the log file.
+	    "Success: Fetched $userID AD account details $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')"  | Out-File -FilePath $logFilePath -Append
+		}
+          catch 
+        {
+		$needNewFile = $true
+        # User not found in Active Directory
+        $OldStatus = "Not Found in AD"
+		
+		 $outputRow = [PSCustomObject]@{
+            'UserID'               = $userID
+			'EMPNAME'              = $EmpName
+            'EMPINTERMINATION'     = $EmpCodeinTermination
+            'EMPINPEOPLE'          = $EmpCodeinPeople
+            'LastDay'              = $LastDay
+            'OldStatus'            = $OldStatus
+			'NewStatus'            = $OldStatus
+            'RecordedDate'         = $RecordedDate
+            'ManagerName'          = "NA"
+			'OldNotes'			   = "NA"
+            'NewNotes'             = "NA"
+			'Existing Groups'      = "NA"
+           }
+          $outputData += $outputRow
+		  
+		  
+		  #Add a failure message in the log file.
+		  $errorMessage = "Failure: Failed to Fetch $userID AD account details. Error: $_"
+          ##write-output $errorMessage
+        $errorMessage | Out-File -FilePath $logFilePath -Append
+		    
+        }
+     # Condition to check if user is enabled, lastdate is less than today, and there is no expiry date updated.
+  #  if ($OldStatus -eq "Enabled" -and $LastDay -lt (Get-Date).Date -and ($expirydate -eq $null)) 
+	  if ($OldStatus -eq "Enabled" -and $LastDay -eq (Get-Date).Date)
+	{q
+        $needNewFile = $true
+		
+		#Add a line in the log file.
+	             "Success: Status is active and requires termination $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')" | Out-File -FilePath $logFilePath -Append
+	
+        # Get ManagerName
+        try {
+            $ManagerName = if ($user.Manager) { (Get-ADUser $user.Manager).Name } else { "Name has been cleared" }
+				
+				#Add a AD account retrieval Success line in the log file.
+	             "Success: Fetched Manager details Sucessfully $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')"  | Out-File -FilePath $logFilePath -Append
+			
+        } catch {
+            # User not found in Active Directory
+            $ManagerName = "Not found in AD"
+			
+			 #Add a failure message in the log file.
+		  $errorMessage = "Failure: Managername empty. Error: $_"
+          ##write-output $errorMessage
+        $errorMessage | Out-File -FilePath $logFilePath -Append
+        }
+
+		#membership code under the if block to reduce stress on AD.
+		try 
+		{
+			$userGroups = Get-ADPrincipalGroupMembership -Identity $userID | Select-Object -ExpandProperty Name
+			$MemberGroups=$userGroups -join ', '
+			 # Check if specific group exists in user's memberships
+              $VisioIsInGroup = $userGroups -contains "Visio2"
+			  $ProjectIsInGroup = $userGroups -contains "Project3"
+			  
+			  #Add a AD account retrieval Success line in the log file.
+	             "Success: Fetched Members Group details Sucessfully $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')"  | Out-File -FilePath $logFilePath -Appe
+		}
+		catch
+		{
+			 $MemberGroups=$null
+			 
+			  #Add a failure message in the log file.
+		  $errorMessage = "Failure: Unable to retrieve Group details. Error: $_"
+          ##write-output $errorMessage
+        $errorMessage | Out-File -FilePath $logFilePath -Append
+		}
+        
+		#Action write code to disable the account
+		
+		#Removing Action
+		#Disable-ADAccount -Identity $user
+		
+   		
+ 		
+		# Get the new status
+        try 
+		{
+            $nuser = Get-ADUser -Identity $userID -Properties Enabled
+            $newStatus = if ($nuser.Enabled) { "Enabled" } else { "Disabled" } 
+			
+				#Add a AD account retrieval Success line in the log file.
+	             "Success: Fetched New status of the user id $userID $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')"  | Out-File -FilePath $logFilePath -Append
+			
+        } 
+		catch 
+		{
+            # User not found in Active Directory
+            $newStatus = "Not Found in AD"
+			
+			 #Add a failure message in the log file.
+		  $errorMessage = "Failure: Failed to Fetch $userID AD account New Status. Error: $_"
+          #write-output $errorMessage
+        $errorMessage | Out-File -FilePath $logFilePath -Append
+        }
+		
+	 #Action Code to remove groups individually since we do not have access to remove few groups
+	  "Success: Removed groups for $userID $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')"  | Out-File -FilePath $logFilePath -Append
+	   foreach ($group in $userGroups) 
+	   {
+		 try 
+		   {
+             #Removing Action
+			 #Remove-ADGroupMember -Identity $group -Members $userID -Confirm:$false
+			 
+			 #Add a log for Groups removal
+	             
+           } 
+		catch
+	    	{
+				 #Add a failure message in the log file.
+		  $errorMessage = "Failure: Failed to remove groups from $userID. Error: $_"
+          #write-output $errorMessage
+        $errorMessage | Out-File -FilePath $logFilePath -Append
+           
+           }
+      }
+	  
+	  #Action Clear manager name if it exists
+       if ($ManagerName -ne "Not found in AD" -and $ManagerName -ne "Name has been cleared") 
+	   {
+          try {
+			  #Removing Action
+              #Set-ADUser -Identity $userID -Manager $null
+			  
+			  	 #Add a log for manager name removal 
+	             "Success: Removed Manager name for $userID $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')"  | Out-File -FilePath $logFilePath -Append
+               
+               } 
+	      catch 
+		      {
+				  #Add a failure message in the log file.
+		  $errorMessage = "Failure: Failed to remove Manager Name for $userID. Error: $_"
+          #write-output $errorMessage
+        $errorMessage | Out-File -FilePath $logFilePath -Append
+			  }
+	   }
+	    
+	    #Action Update Notes attribute with disable Date
+        $notes = "Account disabled on $(Get-Date -Format 'dd-MM-yyyy')"
+        if ($ExistingNotes) {
+			
+           #Removing Action
+           #$notes = "$ExistingNotes`r`n$notes"  # Append new notes to existing notes
+
+
+         #Add a log for Updating notes 
+	     "Success: Updated Notes for $userID $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')"  | Out-File -FilePath $logFilePath -Append
+   
+        }
+		
+		#Removing ACtuon
+        #$user | Set-ADUser -Replace @{Info = $notes}
+	   
+	   
+	    # Action Code to update Description attribute with Last day 
+         try {
+			 # Append Last day information to the Description
+             $LastDayDescription = "Last day: $($LastDay.ToString('dd-MM-yyyy'))"
+             if ($Description) 
+	     	 {
+                    $Description = "$LastDayDescription `n$Description"
+					
+					
+					
+             } 
+	    	 else 
+		     {
+                    $Description = $LastDayDescription
+             }
+			 #Removing Action
+#			 $user | Set-ADUser -Replace @{Description = $Description}		
+              
+			 #Add a log for Updating Description 
+	         "Success: Description updated successfully for $userID $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')"  | Out-File -FilePath $logFilePath -Append
+		    
+			}
+			
+		   catch
+		   {
+			    #Add a failure message in the log file.
+		        $errorMessage = "Failure: Failed to Update description for $userID. Error: $_"
+                #write-output $errorMessage
+               $errorMessage | Out-File -FilePath $logFilePath -Append
+		   }
+			   
+		   
+	   
+	   #Action Move the OU of the user
+       try {
+              # Get the distinguished name of the user
+                $userDN = (Get-ADUser -Identity $userID).DistinguishedName
+                 # Move the user to the target OU
+                 
+                   #Removing Action
+                   #Move-ADObject -Identity $userDN -TargetPath $targetOU
+				   
+				   
+				    #Add a log for Updating OU 
+	              "Success: Changed OU of the user $userID $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')"  | Out-File -FilePath $logFilePath -Append
+                 } 
+	      catch 
+		      {
+				  #Add a failure message in the log file.
+		        $errorMessage = "Failure: Failed to Update OU for $userID. Error: $_"
+                #write-output $errorMessage
+               $errorMessage | Out-File -FilePath $logFilePath -Append
+			  }
+	   
+		
+		 # Create a row in Excel sheet
+        $outputRow = [PSCustomObject]@{
+            'UserID'               = $userID
+			'EMPNAME'              = $EmpName
+            'EMPINTERMINATION'     = $EmpCodeinTermination
+            'EMPINPEOPLE'          = $EmpCodeinPeople
+            'LastDay'              = $LastDay
+            'OldStatus'            = $OldStatus
+			'NewStatus'            = $newStatus
+            'RecordedDate'         = $RecordedDate
+            'ManagerName'          = $ManagerName
+			'OldNotes'			   = $ExistingNotes
+            'NewNotes'             = $notes
+			'Existing Groups'      = $MemberGroups
+        }
+        $outputData += $outputRow
+		
+		try
+		{
+		
+		#Path: Specify the Individual Folder path
+		$folderFullPath="C:\TempLIS\Termination\"
+		
+		#A folder with the employee name will be created in the above path.
+        $folderPath =$folderFullPath+ $EmpName
+         if (!(Test-Path $folderPath -PathType Container))
+		 {
+		   New-Item -Path $folderPath -ItemType Directory 
+         }
+         $timestamp = Get-Date -Format "dd-MM-yyyy hhmmss"
+         
+		 
+		 #Path: Specify the path to the output Excel file with timestamp
+		 $outputExcelFileFullpath="C:\TempLIS\Termination\"
+		 
+         $outputExcelFilePath = $outputExcelFileFullpath+"$EmpName\TitleOutputFile_$timestamp.xlsx"
+         # Export the output data to a new Excel file
+		 $outputRow | Export-Excel -Path $outputExcelFilePath -AutoSize
+		 
+		    #Add a log for Excel file creation  
+	         "Success: Excel File created for the user $userID $(Get-Date -Format 'dd-MM-yyyy hh:mm:ss')"  | Out-File -FilePath $logFilePath -Append
+		}
+		catch
+		{
+			
+				  #Add a failure message in the log file.
+		        $errorMessage = "Failure: Failed to create an excel file for $userID. Error: $_"
+                #write-output $errorMessage
+               $errorMessage | Out-File -FilePath $logFilePath -Append
+			
+		}
+
+
+
+#Lets send an email as a notification
+# Email configuration
+$smtpUsername = "a.b@gmail.com"  # Replace with your email address
+$EmailTo = "mhm2@gmail.com"  # Recipient's email address     
+$EmailSubject = "$empName has been Terminated $LastDay"
+#$EmailCc="b.d@gmail.com"
+	  
+	  
+	  
+# Define the email body
+$emailBody = @"
+Hello Team,
+
+The following user has been terminated:
+UserID: $userID
+EMPNAME: $EmpName
+
+
+"@
+
+# Check if user is in .LAS-M365-License-Project-P3 group and modify email body accordingly
+if ($ProjectIsInGroup) {
+   $emailBody += @"
+Please raise a request to cancel Microsoft Project Subscription as the user is a part of '.LAS-M365-License-Project-P3'.
+
+"@
+}
+# Check if user is in LAS-M365-License-Visio-P2 group and modify email body accordingly
+if ($VisioIsInGroup) {
+   $emailBody += @"
+Please raise a request to cancel Visio Subscription as the user is a part of 'LAS-M365-License-Visio-P2'.
+
+"@
+}
+
+$emailBody += @"
+
+Regards,
+Termination script
+Comapny Profile
+"@
+
+
+        # SMTP server configuration for Office 365
+        $smtpServer = "smtp.domain.i"
+        $smtpPort = 250
+
+        # Send email with attachment
+         try 
+		 {
+               Send-MailMessage -From $smtpUsername -To $EmailTo -Subject $EmailSubject -Body $emailBody -SmtpServer $smtpServer -Port $smtpPort -UseSsl `
+                     -Attachments $outputExcelFilePath
+               
+				
+			#Add a log for Excel file creation  
+	         "Success: Email sent successfully for $userID" | Out-File -FilePath $logFilePath -Append
+				
+         } 
+		 catch 
+		 {
+              #Write-Host "Failed to send email: $_"
+			  
+			  
+				  #Add a failure message in the log file.
+		        $errorMessage = "Failure: Failed to send email: $_"
+                #write-output $errorMessage
+               $errorMessage | Out-File -FilePath $logFilePath -Append
+	     }
+    
+    }
+
+		 else
+		 {
+			 
+		    #Add a line in the log file.
+	           #  "Success: No need to disable the account $userID" | Out-File -FilePath $logFilePath -Append
+		 }
+
+}
+
+#To create an excel file Date Wise to find out what IDs were deleted on which Date
+       if ($needNewFile) 
+	   {             
+              $timestamp = Get-Date -Format "dd-MM-yyyy hhmmss"
+			  $MainExcelFileName-"TitleOutputFile_$timestamp.xlsx"
+			  
+            #Path: Specify the path to the output Excel file with timestamp
+            $outputExcelFilePath = outputExcelFileFullPath+$MainExcelFileName
+			
+			
+			
+            # Export the output data to a new Excel file
+            $outputData | Export-Excel -Path $outputExcelFilePath -AutoSize
+			
+					
+			#Add a log for Excel file creation  
+	         "Success: Excel file for all the IDS has been created successfully for today at $outputExcelFilePath" | Out-File -FilePath $logFilePath -Append
+				
+       }
+
+
+
+$today =Get-Date
+
+# Initialize log message
+"End of Script on $today" | Out-File -FilePath $logFilePath -Append
+
+
+
+
+$outputData=$null;
+$sqlData=$null;
+$logFileName=$null;
+$logFilePath=$null;
+$needNewFile = $false;
+$userID = $null
+$EmpCodeinTermination = $null
+$EmpCodeinPeople = $null
+$smtpUsername=$null;
+$EmailTo=$null;
+$EmailCc=$null;
+$EmailSubject=$null;
+$emailBody=$null;
+$smtpServer=$null;
+$smtpPort=$null;
+$outputExcelFilePath=$null;
+
